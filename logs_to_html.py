@@ -4,11 +4,17 @@
 import sqlite3
 import json
 import html
+import re
 from pathlib import Path
 
 import markdown
 
+# Regex to match git commit output: [branch hash] message
+COMMIT_PATTERN = re.compile(r'\[[\w\-/]+ ([a-f0-9]{7,})\] (.+?)(?:\n|$)')
+
 PROMPTS_PER_PAGE = 5
+LONG_TEXT_THRESHOLD = 1000  # Characters - text blocks longer than this are shown in index
+GITHUB_REPO = "simonw/mquickjs-python"  # For commit links
 
 
 def format_json(obj):
@@ -52,6 +58,39 @@ def render_todo_write(tool_input, tool_id):
     return f'<div class="todo-list" data-tool-id="{html.escape(tool_id)}"><div class="todo-header"><span class="todo-header-icon">☰</span> Task List</div><ul class="todo-items">{"".join(items_html)}</ul></div>'
 
 
+def render_write_tool(tool_input, tool_id):
+    """Render Write tool calls with file path header and content preview."""
+    file_path = tool_input.get("file_path", "Unknown file")
+    content = tool_input.get("content", "")
+    # Extract filename from path
+    filename = file_path.split("/")[-1] if "/" in file_path else file_path
+    content_preview = html.escape(content)
+    return f'''<div class="file-tool write-tool" data-tool-id="{html.escape(tool_id)}">
+<div class="file-tool-header write-header"><span class="file-tool-icon">📝</span> Write <span class="file-tool-path">{html.escape(filename)}</span></div>
+<div class="file-tool-fullpath">{html.escape(file_path)}</div>
+<div class="truncatable"><div class="truncatable-content"><pre class="file-content">{content_preview}</pre></div><button class="expand-btn">Show more</button></div>
+</div>'''
+
+
+def render_edit_tool(tool_input, tool_id):
+    """Render Edit tool calls with diff-like old/new display."""
+    file_path = tool_input.get("file_path", "Unknown file")
+    old_string = tool_input.get("old_string", "")
+    new_string = tool_input.get("new_string", "")
+    replace_all = tool_input.get("replace_all", False)
+    # Extract filename from path
+    filename = file_path.split("/")[-1] if "/" in file_path else file_path
+    replace_note = ' <span class="edit-replace-all">(replace all)</span>' if replace_all else ""
+    return f'''<div class="file-tool edit-tool" data-tool-id="{html.escape(tool_id)}">
+<div class="file-tool-header edit-header"><span class="file-tool-icon">✏️</span> Edit <span class="file-tool-path">{html.escape(filename)}</span>{replace_note}</div>
+<div class="file-tool-fullpath">{html.escape(file_path)}</div>
+<div class="truncatable"><div class="truncatable-content">
+<div class="edit-section edit-old"><div class="edit-label">−</div><pre class="edit-content">{html.escape(old_string)}</pre></div>
+<div class="edit-section edit-new"><div class="edit-label">+</div><pre class="edit-content">{html.escape(new_string)}</pre></div>
+</div><button class="expand-btn">Show more</button></div>
+</div>'''
+
+
 def render_content_block(block):
     if not isinstance(block, dict):
         return f"<p>{html.escape(str(block))}</p>"
@@ -66,6 +105,10 @@ def render_content_block(block):
         tool_id = block.get("id", "")
         if tool_name == "TodoWrite":
             return render_todo_write(tool_input, tool_id)
+        if tool_name == "Write":
+            return render_write_tool(tool_input, tool_id)
+        if tool_name == "Edit":
+            return render_edit_tool(tool_input, tool_id)
         description = tool_input.get("description", "")
         desc_html = f'<div class="tool-description">{html.escape(description)}</div>' if description else ""
         display_input = {k: v for k, v in tool_input.items() if k != "description"}
@@ -74,10 +117,36 @@ def render_content_block(block):
         content = block.get("content", "")
         is_error = block.get("is_error", False)
         error_class = " tool-error" if is_error else ""
-        if isinstance(content, list) or is_json_like(content):
+
+        # Check for git commits and render with styled cards
+        if isinstance(content, str):
+            commits_found = list(COMMIT_PATTERN.finditer(content))
+            if commits_found:
+                # Build commit cards + remaining content
+                parts = []
+                last_end = 0
+                for match in commits_found:
+                    # Add any content before this commit
+                    before = content[last_end:match.start()].strip()
+                    if before:
+                        parts.append(f'<pre>{html.escape(before)}</pre>')
+
+                    commit_hash = match.group(1)
+                    commit_msg = match.group(2)
+                    github_link = f'https://github.com/{GITHUB_REPO}/commit/{commit_hash}'
+                    parts.append(f'<div class="commit-card"><a href="{github_link}"><span class="commit-card-hash">{commit_hash[:7]}</span> {html.escape(commit_msg)}</a></div>')
+                    last_end = match.end()
+
+                # Add any remaining content after last commit
+                after = content[last_end:].strip()
+                if after:
+                    parts.append(f'<pre>{html.escape(after)}</pre>')
+
+                content_html = ''.join(parts)
+            else:
+                content_html = f"<pre>{html.escape(content)}</pre>"
+        elif isinstance(content, list) or is_json_like(content):
             content_html = format_json(content)
-        elif isinstance(content, str):
-            content_html = f"<pre>{html.escape(content)}</pre>"
         else:
             content_html = format_json(content)
         return f'<div class="tool-result{error_class}"><div class="truncatable"><div class="truncatable-content">{content_html}</div><button class="expand-btn">Show more</button></div></div>'
@@ -105,6 +174,77 @@ def render_assistant_message(message_data):
 
 def make_msg_id(timestamp):
     return f"msg-{timestamp.replace(':', '-').replace('.', '-')}"
+
+
+def analyze_conversation(messages):
+    """Analyze messages in a conversation to extract stats and long texts."""
+    tool_counts = {}  # tool_name -> count
+    long_texts = []
+    commits = []  # list of (hash, message, timestamp)
+
+    for log_type, message_json, timestamp in messages:
+        if not message_json:
+            continue
+        try:
+            message_data = json.loads(message_json)
+        except json.JSONDecodeError:
+            continue
+
+        content = message_data.get("content", [])
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type", "")
+
+            if block_type == "tool_use":
+                tool_name = block.get("name", "Unknown")
+                tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+            elif block_type == "tool_result":
+                # Check for git commit output
+                result_content = block.get("content", "")
+                if isinstance(result_content, str):
+                    for match in COMMIT_PATTERN.finditer(result_content):
+                        commits.append((match.group(1), match.group(2), timestamp))
+            elif block_type == "text":
+                text = block.get("text", "")
+                if len(text) >= LONG_TEXT_THRESHOLD:
+                    long_texts.append(text)
+
+    return {
+        "tool_counts": tool_counts,
+        "long_texts": long_texts,
+        "commits": commits,
+    }
+
+
+def format_tool_stats(tool_counts):
+    """Format tool counts into a concise summary string."""
+    if not tool_counts:
+        return ""
+
+    # Abbreviate common tool names
+    abbrev = {
+        "Bash": "bash",
+        "Read": "read",
+        "Write": "write",
+        "Edit": "edit",
+        "Glob": "glob",
+        "Grep": "grep",
+        "Task": "task",
+        "TodoWrite": "todo",
+        "WebFetch": "fetch",
+        "WebSearch": "search",
+    }
+
+    parts = []
+    for name, count in sorted(tool_counts.items(), key=lambda x: -x[1]):
+        short_name = abbrev.get(name, name.lower())
+        parts.append(f"{count} {short_name}")
+
+    return " · ".join(parts)
 
 
 def render_message(log_type, message_json, timestamp):
@@ -158,6 +298,26 @@ time { color: var(--text-muted); font-size: 0.8rem; }
 .tool-description { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 8px; font-style: italic; }
 .tool-result { background: var(--tool-result-bg); border-radius: 8px; padding: 12px; margin: 12px 0; }
 .tool-result.tool-error { background: var(--tool-error-bg); }
+.file-tool { border-radius: 8px; padding: 12px; margin: 12px 0; }
+.write-tool { background: linear-gradient(135deg, #e3f2fd 0%, #e8f5e9 100%); border: 1px solid #4caf50; }
+.edit-tool { background: linear-gradient(135deg, #fff3e0 0%, #fce4ec 100%); border: 1px solid #ff9800; }
+.file-tool-header { font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
+.write-header { color: #2e7d32; }
+.edit-header { color: #e65100; }
+.file-tool-icon { font-size: 1rem; }
+.file-tool-path { font-family: monospace; background: rgba(0,0,0,0.08); padding: 2px 8px; border-radius: 4px; }
+.file-tool-fullpath { font-family: monospace; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 8px; word-break: break-all; }
+.file-content { margin: 0; }
+.edit-section { display: flex; margin: 4px 0; border-radius: 4px; overflow: hidden; }
+.edit-label { padding: 8px 12px; font-weight: bold; font-family: monospace; display: flex; align-items: flex-start; }
+.edit-old { background: #ffebee; }
+.edit-old .edit-label { color: #c62828; background: #ffcdd2; }
+.edit-new { background: #e8f5e9; }
+.edit-new .edit-label { color: #2e7d32; background: #c8e6c9; }
+.edit-content { margin: 0; flex: 1; background: transparent; font-size: 0.85rem; }
+.edit-replace-all { font-size: 0.75rem; font-weight: normal; color: var(--text-muted); }
+.write-tool .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #e6f4ea); }
+.edit-tool .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #fff0e5); }
 .todo-list { background: linear-gradient(135deg, #e8f5e9 0%, #f1f8e9 100%); border: 1px solid #81c784; border-radius: 8px; padding: 12px; margin: 12px 0; }
 .todo-header { font-weight: 600; color: #2e7d32; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
 .todo-items { list-style: none; margin: 0; padding: 0; }
@@ -201,6 +361,22 @@ details.continuation[open] summary { border-radius: 12px 12px 0 0; margin-bottom
 .index-item-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; background: rgba(0,0,0,0.03); font-size: 0.85rem; }
 .index-item-number { font-weight: 600; color: var(--user-border); }
 .index-item-content { padding: 16px; }
+.index-item-stats { padding: 8px 16px 12px 32px; font-size: 0.85rem; color: var(--text-muted); border-top: 1px solid rgba(0,0,0,0.06); }
+.index-item-commit { margin-top: 6px; padding: 4px 8px; background: #fff3e0; border-radius: 4px; font-size: 0.85rem; color: #e65100; }
+.index-item-commit code { background: rgba(0,0,0,0.08); padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; margin-right: 6px; }
+.commit-card { margin: 8px 0; padding: 10px 14px; background: #fff3e0; border-left: 4px solid #ff9800; border-radius: 6px; }
+.commit-card a { text-decoration: none; color: #5d4037; display: block; }
+.commit-card a:hover { color: #e65100; }
+.commit-card-hash { font-family: monospace; color: #e65100; font-weight: 600; margin-right: 8px; }
+.index-commit { margin-bottom: 12px; padding: 10px 16px; background: #fff3e0; border-left: 4px solid #ff9800; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+.index-commit a { display: block; text-decoration: none; color: inherit; }
+.index-commit a:hover { background: rgba(255, 152, 0, 0.1); margin: -10px -16px; padding: 10px 16px; border-radius: 8px; }
+.index-commit-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; margin-bottom: 4px; }
+.index-commit-hash { font-family: monospace; color: #e65100; font-weight: 600; }
+.index-commit-msg { color: #5d4037; }
+.index-item-long-text { margin-top: 8px; padding: 12px; background: var(--card-bg); border-radius: 8px; border-left: 3px solid var(--assistant-border); }
+.index-item-long-text .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, var(--card-bg)); }
+.index-item-long-text-content { color: var(--text-color); }
 @media (max-width: 600px) { body { padding: 8px; } .message, .index-item { border-radius: 8px; } .message-content, .index-item-content { padding: 12px; } pre { font-size: 0.8rem; padding: 8px; } }
 '''
 
@@ -251,6 +427,23 @@ def generate_pagination_html(current_page, total_pages):
             parts.append(f'<a href="page-{page:03d}.html">{page}</a>')
     if current_page < total_pages:
         parts.append(f'<a href="page-{current_page+1:03d}.html">Next →</a>')
+    else:
+        parts.append('<span class="disabled">Next →</span>')
+    parts.append('</div>')
+    return '\n'.join(parts)
+
+
+def generate_index_pagination_html(total_pages):
+    """Generate pagination for index page where Index is current (first page)."""
+    if total_pages < 1:
+        return '<div class="pagination"><span class="current">Index</span></div>'
+    parts = ['<div class="pagination">', '<span class="current">Index</span>']
+    # No prev link since Index is first
+    parts.append('<span class="disabled">← Prev</span>')
+    for page in range(1, total_pages + 1):
+        parts.append(f'<a href="page-{page:03d}.html">{page}</a>')
+    if total_pages >= 1:
+        parts.append('<a href="page-001.html">Next →</a>')
     else:
         parts.append('<span class="disabled">Next →</span>')
     parts.append('</div>')
@@ -339,20 +532,65 @@ def generate_html(db_path, output_dir):
         (output_dir / f"page-{page_num:03d}.html").write_text(page_content)
         print(f"Generated page-{page_num:03d}.html")
 
-    index_items = []
+    # Calculate overall stats and collect all commits for timeline
+    total_tool_counts = {}
+    total_messages = 0
+    all_commits = []  # (timestamp, hash, message, page_num, conv_index)
+    for i, conv in enumerate(conversations):
+        total_messages += len(conv["messages"])
+        stats = analyze_conversation(conv["messages"])
+        for tool, count in stats["tool_counts"].items():
+            total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
+        page_num = (i // PROMPTS_PER_PAGE) + 1
+        for commit_hash, commit_msg, commit_ts in stats["commits"]:
+            all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
+    total_tool_calls = sum(total_tool_counts.values())
+    total_commits = len(all_commits)
+
+    # Build timeline items: prompts and commits merged by timestamp
+    timeline_items = []
+
+    # Add prompts
     prompt_num = 0
     for i, conv in enumerate(conversations):
         if conv.get("is_continuation"):
-            continue  # Skip continuation summaries from index
+            continue
         if conv["user_text"].startswith("Stop hook feedback:"):
-            continue  # Skip stop hook feedback from index
+            continue
         prompt_num += 1
         page_num = (i // PROMPTS_PER_PAGE) + 1
         msg_id = make_msg_id(conv["timestamp"])
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
-        index_items.append(f'<div class="index-item"><a href="{html.escape(link)}"><div class="index-item-header"><span class="index-item-number">#{prompt_num}</span><time datetime="{html.escape(conv["timestamp"])}" data-timestamp="{html.escape(conv["timestamp"])}">{html.escape(conv["timestamp"])}</time></div><div class="index-item-content">{rendered_content}</div></a></div>')
 
+        # Analyze conversation for stats (excluding commits from inline display now)
+        stats = analyze_conversation(conv["messages"])
+        tool_stats_str = format_tool_stats(stats["tool_counts"])
+
+        stats_html = ""
+        if tool_stats_str or stats["long_texts"]:
+            long_texts_html = ""
+            for lt in stats["long_texts"]:
+                rendered_lt = render_markdown_text(lt)
+                long_texts_html += f'<div class="index-item-long-text"><div class="truncatable"><div class="truncatable-content"><div class="index-item-long-text-content">{rendered_lt}</div></div><button class="expand-btn">Show more</button></div></div>'
+
+            stats_line = f'<span>{tool_stats_str}</span>' if tool_stats_str else ""
+            stats_html = f'<div class="index-item-stats">{stats_line}{long_texts_html}</div>'
+
+        item_html = f'<div class="index-item"><a href="{html.escape(link)}"><div class="index-item-header"><span class="index-item-number">#{prompt_num}</span><time datetime="{html.escape(conv["timestamp"])}" data-timestamp="{html.escape(conv["timestamp"])}">{html.escape(conv["timestamp"])}</time></div><div class="index-item-content">{rendered_content}</div></a>{stats_html}</div>'
+        timeline_items.append((conv["timestamp"], "prompt", item_html))
+
+    # Add commits as separate timeline items
+    for commit_ts, commit_hash, commit_msg, page_num, conv_idx in all_commits:
+        github_link = f"https://github.com/{GITHUB_REPO}/commit/{commit_hash}"
+        item_html = f'''<div class="index-commit"><a href="{github_link}"><div class="index-commit-header"><span class="index-commit-hash">{commit_hash[:7]}</span><time datetime="{html.escape(commit_ts)}" data-timestamp="{html.escape(commit_ts)}">{html.escape(commit_ts)}</time></div><div class="index-commit-msg">{html.escape(commit_msg)}</div></a></div>'''
+        timeline_items.append((commit_ts, "commit", item_html))
+
+    # Sort by timestamp
+    timeline_items.sort(key=lambda x: x[0])
+    index_items = [item[2] for item in timeline_items]
+
+    index_pagination = generate_index_pagination_html(total_pages)
     index_content = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -364,9 +602,10 @@ def generate_html(db_path, output_dir):
 <body>
     <div class="container">
         <h1>Conversation Log</h1>
-        <div class="pagination" style="justify-content: flex-end;"><a href="page-001.html">Page 1 →</a></div>
-        <p style="color: var(--text-muted); margin-bottom: 24px;">{prompt_num} prompts across {total_pages} pages</p>
+        {index_pagination}
+        <p style="color: var(--text-muted); margin-bottom: 24px;">{prompt_num} prompts · {total_messages} messages · {total_tool_calls} tool calls · {total_commits} commits · {total_pages} pages</p>
         {''.join(index_items)}
+        {index_pagination}
     </div>
     <script>{JS}</script>
 </body>
